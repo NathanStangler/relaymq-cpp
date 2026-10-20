@@ -220,7 +220,7 @@ std::optional<Message> Client::request(const std::string& subject, const std::st
     }
 
     uint64_t req_id = next_request_id_++;
-    std::string reply_subject = "_REPLY." + std::to_string(req_id);
+    std::string reply_subject = "reply." + std::to_string(req_id);
 
     std::shared_ptr<std::promise<Message>> promise = std::make_shared<std::promise<Message>>();
     std::future<Message> future = promise->get_future();
