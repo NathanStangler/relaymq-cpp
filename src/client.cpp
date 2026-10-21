@@ -89,6 +89,8 @@ bool Client::connect(const ClientOptions& options) {
         return true;
     }
 
+    tcp_close(socket_fd_);
+
     if (receive_thread_.joinable()) {
         receive_thread_.join();
     }
@@ -146,6 +148,10 @@ void Client::disconnect() {
         }
     }
 
+    std::unique_lock<std::mutex> lock(sub_mutex_);
+    subscriptions_.clear();
+    lock.unlock();
+
     pong_cv_.notify_all();
     auth_cv_.notify_all();
 }
@@ -182,11 +188,20 @@ bool Client::send_raw(std::string_view data) {
 }
 
 bool Client::publish(const std::string& subject, const std::string& payload, const std::string& reply_to) {
+    if (subject.empty()) {
+        last_error_ = "Subject cannot be empty";
+        return false;
+    }
     std::string msg = ProtocolParser::format_pub(subject, payload, reply_to);
     return send_raw(msg);
 }
 
 std::string Client::subscribe(const std::string& subject, MessageCallback callback) {
+    if (subject.empty() || !callback) {
+        last_error_ = "Subject and callback cannot be empty";
+        return "";
+    }
+
     uint64_t sid_num = next_sid_++;
     std::string sid = std::to_string(sid_num);
 
@@ -216,6 +231,11 @@ bool Client::unsubscribe(const std::string& sid) {
 
 std::optional<Message> Client::request(const std::string& subject, const std::string& payload, int timeout_ms) {
     if (!is_connected_) {
+        last_error_ = "Not connected";
+        return std::nullopt;
+    }
+    if (subject.empty()) {
+        last_error_ = "Subject cannot be empty";
         return std::nullopt;
     }
 
@@ -242,13 +262,22 @@ std::optional<Message> Client::request(const std::string& subject, const std::st
         return std::nullopt;
     }
 
-    std::future_status status = future.wait_for(std::chrono::milliseconds(timeout_ms));
-    unsubscribe(sid);
-
-    if (status == std::future_status::ready) {
-        return future.get();
+    int interval_ms = 20;
+    int waited_ms = 0;
+    while (waited_ms < timeout_ms) {
+        int step = std::min(interval_ms, timeout_ms - waited_ms);
+        if (future.wait_for(std::chrono::milliseconds(step)) == std::future_status::ready) {
+            unsubscribe(sid);
+            return future.get();
+        }
+        if (!is_connected_) {
+            unsubscribe(sid);
+            return std::nullopt;
+        }
+        waited_ms += step;
     }
 
+    unsubscribe(sid);
     return std::nullopt;
 }
 
@@ -287,6 +316,7 @@ void Client::receive_loop() {
         ssize_t bytes_read = recv(socket_fd_, buffer, sizeof(buffer), 0);
         if (bytes_read <= 0) {
             is_connected_ = false;
+            tcp_close(socket_fd_);
             DisconnectCallback cb;
             std::unique_lock<std::mutex> lock(sub_mutex_);
             cb = disconnect_callback_;

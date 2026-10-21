@@ -1,9 +1,23 @@
 #include "relaymq/protocol.hpp"
 #include <charconv>
+#include <cstdint>
+#include <cctype>
 #include <format>
 #include <vector>
 
 namespace relaymq {
+
+static bool equals_ignore_case(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (std::toupper(static_cast<unsigned char>(a[i])) != std::toupper(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
 
 std::string to_string(CommandType type) {
     switch (type) {
@@ -113,25 +127,25 @@ bool ProtocolParser::next_command(Command& cmd) {
 
     std::string_view action_name = tokens[0];
 
-    if (action_name == "PING") {
+    if (equals_ignore_case(action_name, "PING")) {
         buffer_.erase(0, line_end + 2);
         cmd = Command{};
         cmd.type = CommandType::PING;
         return true;
     }
-    if (action_name == "PONG") {
+    if (equals_ignore_case(action_name, "PONG")) {
         buffer_.erase(0, line_end + 2);
         cmd = Command{};
         cmd.type = CommandType::PONG;
         return true;
     }
-    if (action_name == "OK") {
+    if (equals_ignore_case(action_name, "OK")) {
         buffer_.erase(0, line_end + 2);
         cmd = Command{};
         cmd.type = CommandType::OK;
         return true;
     }
-    if (action_name == "ERR") {
+    if (equals_ignore_case(action_name, "ERR")) {
         std::string reason;
         if (line.size() > 4) {
             reason = std::string(line.substr(4));
@@ -142,7 +156,7 @@ bool ProtocolParser::next_command(Command& cmd) {
         cmd.error_message = std::move(reason);
         return true;
     }
-    if (action_name == "AUTH") {
+    if (equals_ignore_case(action_name, "AUTH")) {
         if (tokens.size() < 2) {
             buffer_.erase(0, line_end + 2);
             cmd = Command{};
@@ -157,7 +171,7 @@ bool ProtocolParser::next_command(Command& cmd) {
         cmd.auth_token = std::move(token);
         return true;
     }
-    if (action_name == "SUB") {
+    if (equals_ignore_case(action_name, "SUB")) {
         if (tokens.size() < 3) {
             buffer_.erase(0, line_end + 2);
             cmd = Command{};
@@ -174,7 +188,7 @@ bool ProtocolParser::next_command(Command& cmd) {
         cmd.sid = std::move(sub_sid);
         return true;
     }
-    if (action_name == "UNSUB") {
+    if (equals_ignore_case(action_name, "UNSUB")) {
         if (tokens.size() < 2) {
             buffer_.erase(0, line_end + 2);
             cmd = Command{};
@@ -189,7 +203,7 @@ bool ProtocolParser::next_command(Command& cmd) {
         cmd.sid = std::move(unsub_sid);
         return true;
     }
-    if (action_name == "PUB") {
+    if (equals_ignore_case(action_name, "PUB")) {
         if (tokens.size() < 3) {
             buffer_.erase(0, line_end + 2);
             cmd = Command{};
@@ -222,6 +236,23 @@ bool ProtocolParser::next_command(Command& cmd) {
             }
         }
 
+        constexpr size_t MAX_PAYLOAD_SIZE = 64 * 1024 * 1024;
+        if (payload_len > MAX_PAYLOAD_SIZE) {
+            buffer_.erase(0, line_end + 2);
+            cmd = Command{};
+            cmd.type = CommandType::ERR;
+            cmd.error_message = "Payload size exceeds maximum allowed size";
+            return true;
+        }
+
+        if (payload_len > SIZE_MAX - (line_end + 4)) {
+            buffer_.erase(0, line_end + 2);
+            cmd = Command{};
+            cmd.type = CommandType::ERR;
+            cmd.error_message = "Invalid byte length in PUB command";
+            return true;
+        }
+
         size_t total_required = line_end + payload_len + 4;
         if (buffer_.size() < total_required) {
             return false;
@@ -239,7 +270,7 @@ bool ProtocolParser::next_command(Command& cmd) {
         cmd.payload = std::move(payload);
         return true;
     }
-    if (action_name == "MSG") {
+    if (equals_ignore_case(action_name, "MSG")) {
         if (tokens.size() < 4) {
             buffer_.erase(0, line_end + 2);
             cmd = Command{};
@@ -271,6 +302,23 @@ bool ProtocolParser::next_command(Command& cmd) {
                 cmd.error_message = "Invalid byte length in MSG command";
                 return true;
             }
+        }
+
+        constexpr size_t MAX_PAYLOAD_SIZE = 64 * 1024 * 1024;
+        if (payload_len > MAX_PAYLOAD_SIZE) {
+            buffer_.erase(0, line_end + 2);
+            cmd = Command{};
+            cmd.type = CommandType::ERR;
+            cmd.error_message = "Payload size exceeds maximum allowed size";
+            return true;
+        }
+
+        if (payload_len > SIZE_MAX - (line_end + 4)) {
+            buffer_.erase(0, line_end + 2);
+            cmd = Command{};
+            cmd.type = CommandType::ERR;
+            cmd.error_message = "Invalid byte length in MSG command";
+            return true;
         }
 
         size_t total_required = line_end + payload_len + 4;

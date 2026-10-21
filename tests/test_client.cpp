@@ -230,3 +230,25 @@ TEST(ClientTest, RequestReply) {
 
     client.disconnect();
 }
+
+TEST(ClientTest, ValidationAndReconnect) {
+    MockServer server;
+    ASSERT_TRUE(server.start());
+
+    relaymq::Client client;
+    ASSERT_TRUE(client.connect("127.0.0.1", server.port()));
+
+    EXPECT_FALSE(client.publish("", "payload"));
+    EXPECT_FALSE(client.last_error().empty());
+
+    EXPECT_EQ(client.subscribe("", [](const relaymq::Message&) {}), "");
+
+    client.disconnect();
+    EXPECT_FALSE(client.is_connected());
+
+    EXPECT_TRUE(client.connect("127.0.0.1", server.port()));
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_GE(client.ping(), 0);
+
+    client.disconnect();
+}

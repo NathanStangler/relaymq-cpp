@@ -118,3 +118,46 @@ TEST(ProtocolParserTest, AuthCommands) {
     EXPECT_EQ(cmd.type, relaymq::CommandType::ERR);
     EXPECT_EQ(cmd.error_message, "Invalid AUTH syntax: expected AUTH <token>");
 }
+
+TEST(ProtocolParserTest, CaseInsensitiveCommands) {
+    relaymq::ProtocolParser parser;
+    relaymq::Command cmd;
+
+    parser.append("ping\r\npong\r\nok\r\nerr wrong\r\nauth token\r\nsub service.event 1\r\nunsub 1\r\n");
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::PING);
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::PONG);
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::OK);
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::ERR);
+    EXPECT_EQ(cmd.error_message, "wrong");
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::AUTH);
+    EXPECT_EQ(cmd.auth_token, "token");
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::SUB);
+    EXPECT_EQ(cmd.subject, "service.event");
+    EXPECT_EQ(cmd.sid, "1");
+
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::UNSUB);
+    EXPECT_EQ(cmd.sid, "1");
+}
+
+TEST(ProtocolParserTest, MaxPayloadExceeded) {
+    relaymq::ProtocolParser parser;
+    relaymq::Command cmd;
+
+    parser.append("PUB test.subject 100000000\r\n");
+    ASSERT_TRUE(parser.next_command(cmd));
+    EXPECT_EQ(cmd.type, relaymq::CommandType::ERR);
+    EXPECT_EQ(cmd.error_message, "Payload size exceeds maximum allowed size");
+}
