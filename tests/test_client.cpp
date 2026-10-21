@@ -39,36 +39,35 @@ public:
     }
 
     bool start() {
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) {
+        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sfd < 0) {
             return false;
         }
 
         int opt = 1;
-        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = 0;
 
-        if (bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-            close(listen_fd_);
-            listen_fd_ = -1;
+        if (bind(sfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            close(sfd);
             return false;
         }
 
-        if (listen(listen_fd_, 5) < 0) {
-            close(listen_fd_);
-            listen_fd_ = -1;
+        if (listen(sfd, 5) < 0) {
+            close(sfd);
             return false;
         }
 
         socklen_t len = sizeof(addr);
-        if (getsockname(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0) {
+        if (getsockname(sfd, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0) {
             port_ = ntohs(addr.sin_port);
         }
 
+        listen_fd_.store(sfd);
         is_running_ = true;
         server_thread_ = std::thread(&MockServer::run, this);
         return true;
@@ -76,13 +75,15 @@ public:
 
     void stop() {
         is_running_ = false;
+        int lfd = listen_fd_.exchange(-1);
+        if (lfd >= 0) {
+            shutdown(lfd, SHUT_RDWR);
+            close_fd(lfd);
+        }
         int cfd = client_fd_.exchange(-1);
         if (cfd >= 0) {
+            shutdown(cfd, SHUT_RDWR);
             close_fd(cfd);
-        }
-        if (listen_fd_ >= 0) {
-            close_fd(listen_fd_);
-            listen_fd_ = -1;
         }
         if (server_thread_.joinable()) {
             server_thread_.join();
@@ -94,7 +95,7 @@ public:
     }
 
 private:
-    int listen_fd_;
+    std::atomic<int> listen_fd_;
     uint16_t port_;
     std::atomic<bool> is_running_;
     std::atomic<int> client_fd_;
@@ -102,14 +103,18 @@ private:
 
     void run() {
         while (is_running_) {
+            int lfd = listen_fd_.load();
+            if (lfd < 0) {
+                break;
+            }
             sockaddr_in client_addr{};
             socklen_t len = sizeof(client_addr);
-            int fd = accept(listen_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &len);
+            int fd = accept(lfd, reinterpret_cast<struct sockaddr*>(&client_addr), &len);
             if (fd < 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
-            client_fd_ = fd;
+            client_fd_.store(fd);
 
             relaymq::ProtocolParser parser;
             char buf[4096];

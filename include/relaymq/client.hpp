@@ -45,7 +45,7 @@ public:
     bool connect(const ClientOptions& options);
     void disconnect();
     bool is_connected() const;
-    const std::string& last_error() const;
+    std::string last_error();
     void set_disconnect_callback(DisconnectCallback callback);
     void set_error_callback(ErrorCallback callback);
     bool publish(const std::string& subject, const std::string& payload, const std::string& reply_to = "");
@@ -55,7 +55,7 @@ public:
     int64_t ping(int timeout_ms = 2000);
 
 private:
-    int socket_fd_ = -1;
+    std::atomic<int> socket_fd_ = -1;
     std::atomic<bool> is_connected_ = false;
     ProtocolParser parser_;
     std::thread receive_thread_;
@@ -65,6 +65,7 @@ private:
     std::atomic<uint64_t> next_request_id_ = 1;
     std::unordered_map<std::string, MessageCallback> subscriptions_;
     DisconnectCallback disconnect_callback_;
+    std::mutex error_mutex_;
     ErrorCallback error_callback_;
     std::string last_error_;
     std::mutex pong_mutex_;
@@ -77,6 +78,7 @@ private:
 
     bool send_raw(std::string_view data);
     void receive_loop();
+    void set_last_error(std::string err);
 };
 
 }

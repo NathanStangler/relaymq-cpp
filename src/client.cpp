@@ -38,14 +38,6 @@ static int tcp_connect(const std::string& host, uint16_t port) {
     return fd;
 }
 
-static void tcp_close(int& fd) {
-    if (fd >= 0) {
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
-        fd = -1;
-    }
-}
-
 static ssize_t tcp_send_all(int fd, std::string_view data) {
     if (fd < 0) {
         return -1;
@@ -60,6 +52,16 @@ static ssize_t tcp_send_all(int fd, std::string_view data) {
         total_sent += static_cast<size_t>(sent);
     }
     return static_cast<ssize_t>(total_sent);
+}
+
+void Client::set_last_error(std::string err) {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    last_error_ = std::move(err);
+}
+
+std::string Client::last_error() {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    return last_error_;
 }
 
 Client::Client() = default;
@@ -89,19 +91,17 @@ bool Client::connect(const ClientOptions& options) {
         return true;
     }
 
-    tcp_close(socket_fd_);
+    disconnect();
 
-    if (receive_thread_.joinable()) {
-        receive_thread_.join();
-    }
     parser_.clear();
-    last_error_.clear();
+    set_last_error("");
 
-    socket_fd_ = tcp_connect(options.host, options.port);
-    if (socket_fd_ < 0) {
-        last_error_ = "Failed to establish TCP connection";
+    int fd = tcp_connect(options.host, options.port);
+    if (fd < 0) {
+        set_last_error("Failed to establish TCP connection");
         return false;
     }
+    socket_fd_.store(fd);
 
     is_connected_ = true;
     receive_thread_ = std::thread(&Client::receive_loop, this);
@@ -115,7 +115,7 @@ bool Client::connect(const ClientOptions& options) {
         if (!send_raw(auth_msg)) {
             awaiting_auth_ = false;
             disconnect();
-            last_error_ = "Failed to send AUTH frame";
+            set_last_error("Failed to send AUTH frame");
             return false;
         }
 
@@ -126,8 +126,8 @@ bool Client::connect(const ClientOptions& options) {
         if (!received || !is_connected_ || !auth_success_.load()) {
             awaiting_auth_ = false;
             disconnect();
-            if (last_error_.empty()) {
-                last_error_ = "Authentication timed out or rejected";
+            if (last_error().empty()) {
+                set_last_error("Authentication timed out or rejected");
             }
             return false;
         }
@@ -138,7 +138,11 @@ bool Client::connect(const ClientOptions& options) {
 
 void Client::disconnect() {
     is_connected_ = false;
-    tcp_close(socket_fd_);
+
+    int fd = socket_fd_.load();
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+    }
 
     if (receive_thread_.joinable()) {
         if (std::this_thread::get_id() != receive_thread_.get_id()) {
@@ -146,6 +150,11 @@ void Client::disconnect() {
         } else {
             receive_thread_.detach();
         }
+    }
+
+    int to_close = socket_fd_.exchange(-1);
+    if (to_close >= 0) {
+        close(to_close);
     }
 
     std::unique_lock<std::mutex> lock(sub_mutex_);
@@ -160,26 +169,24 @@ bool Client::is_connected() const {
     return is_connected_;
 }
 
-const std::string& Client::last_error() const {
-    return last_error_;
-}
-
 void Client::set_disconnect_callback(DisconnectCallback callback) {
     std::unique_lock<std::mutex> lock(sub_mutex_);
     disconnect_callback_ = std::move(callback);
 }
 
 void Client::set_error_callback(ErrorCallback callback) {
+    std::lock_guard<std::mutex> lock(error_mutex_);
     error_callback_ = std::move(callback);
 }
 
 bool Client::send_raw(std::string_view data) {
     std::lock_guard<std::mutex> lock(send_mutex_);
-    if (!is_connected_ || socket_fd_ < 0) {
+    int fd = socket_fd_.load();
+    if (!is_connected_ || fd < 0) {
         return false;
     }
 
-    ssize_t sent = tcp_send_all(socket_fd_, data);
+    ssize_t sent = tcp_send_all(fd, data);
     if (sent < 0 || static_cast<size_t>(sent) < data.size()) {
         is_connected_ = false;
         return false;
@@ -189,7 +196,7 @@ bool Client::send_raw(std::string_view data) {
 
 bool Client::publish(const std::string& subject, const std::string& payload, const std::string& reply_to) {
     if (subject.empty()) {
-        last_error_ = "Subject cannot be empty";
+        set_last_error("Subject cannot be empty");
         return false;
     }
     std::string msg = ProtocolParser::format_pub(subject, payload, reply_to);
@@ -198,7 +205,7 @@ bool Client::publish(const std::string& subject, const std::string& payload, con
 
 std::string Client::subscribe(const std::string& subject, MessageCallback callback) {
     if (subject.empty() || !callback) {
-        last_error_ = "Subject and callback cannot be empty";
+        set_last_error("Subject and callback cannot be empty");
         return "";
     }
 
@@ -231,11 +238,11 @@ bool Client::unsubscribe(const std::string& sid) {
 
 std::optional<Message> Client::request(const std::string& subject, const std::string& payload, int timeout_ms) {
     if (!is_connected_) {
-        last_error_ = "Not connected";
+        set_last_error("Not connected");
         return std::nullopt;
     }
     if (subject.empty()) {
-        last_error_ = "Subject cannot be empty";
+        set_last_error("Subject cannot be empty");
         return std::nullopt;
     }
 
@@ -313,10 +320,13 @@ void Client::receive_loop() {
     char buffer[16384];
 
     while (is_connected_) {
-        ssize_t bytes_read = recv(socket_fd_, buffer, sizeof(buffer), 0);
+        int fd = socket_fd_.load();
+        if (fd < 0) {
+            break;
+        }
+        ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
         if (bytes_read <= 0) {
             is_connected_ = false;
-            tcp_close(socket_fd_);
             DisconnectCallback cb;
             std::unique_lock<std::mutex> lock(sub_mutex_);
             cb = disconnect_callback_;
@@ -360,7 +370,7 @@ void Client::receive_loop() {
                     auth_cv_.notify_all();
                 }
             } else if (cmd.type == CommandType::ERR) {
-                last_error_ = cmd.error_message;
+                set_last_error(cmd.error_message);
 
                 if (awaiting_auth_.load()) {
                     std::unique_lock<std::mutex> lock(auth_mutex_);
@@ -371,8 +381,13 @@ void Client::receive_loop() {
                     auth_cv_.notify_all();
                 }
 
-                if (error_callback_) {
-                    error_callback_(cmd.error_message);
+                ErrorCallback err_cb;
+                std::unique_lock<std::mutex> lock(error_mutex_);
+                err_cb = error_callback_;
+                lock.unlock();
+
+                if (err_cb) {
+                    err_cb(cmd.error_message);
                 }
             }
         }
